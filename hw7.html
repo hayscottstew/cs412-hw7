@@ -97,7 +97,7 @@ const float FLOOR_Y = -2.0;
 const float CHECKER_SIZE = 3.0;
 const float GLASS_IOR = 1.5;  // refractive index of the glass sphere
 const int NUM_LIGHTS = 3;
-const int SAMPLES_PER_PIXEL = 4;
+const int SAMPLES_PER_PIXEL = 8;
 const vec3 GLASS_ABSORPTION = vec3(0.12, 0.04, 0.02);
 
 struct Ray {
@@ -197,7 +197,7 @@ float schlick(float cosine, float ref_idx) {
 }
 // hash function for monte carlo - fresnel sampling
 float hash13(vec3 p3) {
-  p3 = fract(p3 * 0.1031);s
+  p3 = fract(p3 * 0.1031);
   p3 += dot(p3, p3.zyx + 31.32);
   return fract((p3.x + p3.y) * p3.z);
 }
@@ -209,7 +209,7 @@ bool intersectFloor(Ray ray, out float t) {
 }
 
 HitData traceScene(Ray ray, bool includeLight) {
-    HitData hit;s
+    HitData hit;
     hit.hit = false;
     hit.t = 1e10;
     float t;
@@ -247,82 +247,128 @@ HitData traceScene(Ray ray, bool includeLight) {
     return hit;
 }
 
-vec3 trace(Ray ray) {
-    vec3 color = vec3(0.0);
-    vec3 attenuation = vec3(1.0);
+vec3 trace(Ray ray, float sampleId) {
+  vec3 color = vec3(0.0);
+  vec3 attenuation = vec3(1.0);
 
-    //use loop to simulate the recursive process as GLSL doesn't support recursions
-    for (int bounce = 0; bounce < u_maxBounces; bounce++) {
-        HitData hit = traceScene(ray, true);
+  for (int bounce = 0; bounce < u_maxBounces; bounce++) {
+      HitData hit = traceScene(ray, true);
 
-        if (!hit.hit) {
-            float t = 0.5 * (ray.direction.y + 1.0);
-            color += attenuation * mix(vec3(0.09, 0.12, 0.18), vec3(0.18, 0.21, 0.27), t);  // sky
-            break;
-        }
+      if (!hit.hit) {
+          float t = 0.5 * (ray.direction.y + 1.0);
+          color += attenuation * mix(vec3(0.09, 0.12, 0.18), vec3(0.18, 0.21, 0.27), t);
+          break;
+      }
 
-        if (hit.isLight) {
-            color += attenuation * lightSphere.color * LIGHT_POWER;
-            break;
-        }
+      if (hit.isLight) {
+          color += attenuation * hit.color * LIGHT_POWER;
+          break;
+      }
 
-        // Refraction: (option 1)either reflects or refracts the ray, whichever Schlick says is stronger
-        // (option 2): finalColor = hit.color * (F * reflectionColor + (1.0 - F) * refractionColor)
-        // (option 3): Monte Carlo Sampling (multiple rays per pixel), reflect with probability F (random() < schlick_value), else refract, and average many samples per pixel
-        //<!-- if (hit.isGlass) {
-        //    <!-- insert your code here -->
+      if (hit.isGlass) {
+          bool entering = dot(ray.direction, hit.normal) < 0.0;
+          vec3 outwardNormal = entering ? hit.normal : -hit.normal;
+          float eta = entering ? (1.0 / GLASS_IOR) : GLASS_IOR;
+          float cosine = -dot(ray.direction, outwardNormal);
 
-        //    vec3 direction;
-        //    if (total_internal_reflection || schlick_value > 0.5) {
-                //direction = reflection ray
-        //        <!-- insert your code here -->
-        //    } else {
-                //direction = refraction ray
-        //        <!-- insert your code here -->
-        //    }
+          if (!entering) {
+              attenuation *= exp(-GLASS_ABSORPTION * hit.t);
+          } else {
+              vec3 viewDir = -ray.direction;
+              for (int i = 0; i < NUM_LIGHTS; i++) {
+                  vec3 toLight = lights[i].center - hit.point;
+                  float lightDist = length(toLight);
+                  vec3 lightDir = toLight / lightDist;
+                  HitData blocker = traceScene(Ray(hit.point + outwardNormal * 0.002, lightDir), false);
+                  if (!blocker.hit || blocker.t >= lightDist) {
+                      vec3 reflectDir = reflect(-lightDir, outwardNormal);
+                      float spec = pow(max(dot(viewDir, reflectDir), 0.0), max(u_shininess * 2.0, 64.0));
+                      float falloff = 1.0 / (1.0 + u_attenuation * lightDist * lightDist);
+                      color += attenuation * lights[i].color * LIGHT_POWER * spec * falloff * 0.5;
+                  }
+              }
+          }
 
-        //    ray = Ray(hit.point + direction * 0.001, direction);
-        ////Use Schlick approximation to determine contributions from reflection and refraction
-        //    attenuation *= hit.color;
-        //    continue;
-        //}
+          vec3 refracted = refraction(ray.direction, outwardNormal, eta);
+          bool totalInternalReflection = dot(refracted, refracted) < 0.0001;
+          float fresnel = schlick(cosine, GLASS_IOR);
+          float rng = hash13(vec3(gl_FragCoord.xy, sampleId * 17.0 + float(bounce) * 31.0));
 
-        vec3 toLight = lightSphere.center - hit.point;
-        float lightDist = length(toLight);
-        vec3 lightDir = toLight / lightDist;
+          vec3 direction;
+          vec3 offset;
 
-        HitData blocker = traceScene(Ray(hit.point + hit.normal * 0.001, lightDir), false);
-        float visible = blocker.hit && blocker.t < lightDist ? 0.0 : 1.0;
-        float diff = max(dot(hit.normal, lightDir), 0.0);
-        float falloff = 1.0 / (1.0 + 0.1 * lightDist * lightDist);
+          //if (totalInternalReflection || rng < fresnel) { 
+            //use choose instead of rand sampling
+            
+            if (totalInternalReflection || fresnel > 0.5) {
+              direction = reflect(ray.direction, outwardNormal);
+              offset = outwardNormal * 0.002;
+          } else {
+              direction = normalize(refracted);
+              offset = -outwardNormal * 0.002;
+          }
 
-        //  (optional) Ambient fill light approximates indirect light we don't trace.
-        vec3 shading = hit.color * (LIGHT_POWER * diff * falloff * visible + u_ambientStrength);
-        color += attenuation * shading * (1.0 - hit.reflectivity);
+          if (entering) attenuation *= hit.color;
+          ray = Ray(hit.point + offset, direction);
+          continue;
+      }
 
-        if (hit.reflectivity == 0.0) break;
-        attenuation *= hit.reflectivity;
-        ray = Ray(hit.point + hit.normal * 0.001, reflect(ray.direction, hit.normal));
-    }
+      vec3 viewDir = -ray.direction;
+      vec3 shading = hit.color * u_ambientStrength;
 
-    return color;
+      for (int i = 0; i < NUM_LIGHTS; i++) {
+          vec3 toLight = lights[i].center - hit.point;
+          float lightDist = length(toLight);
+          vec3 lightDir = toLight / lightDist;
+
+          HitData blocker = traceScene(Ray(hit.point + hit.normal * 0.002, lightDir), false);
+          vec3 visibility = vec3(1.0);
+          if (blocker.hit && blocker.t < lightDist) {
+              visibility = blocker.isGlass ? (blocker.color * 0.45) : vec3(0.0);
+          }
+
+          float diff = max(dot(hit.normal, lightDir), 0.0);
+          vec3 reflectDir = reflect(-lightDir, hit.normal);
+          float spec = pow(max(dot(viewDir, reflectDir), 0.0), u_shininess);
+          float falloff = 1.0 / (1.0 + u_attenuation * lightDist * lightDist);
+
+          vec3 localLight = (hit.color * diff + vec3(spec) * 0.5) * lights[i].color * LIGHT_POWER * falloff;
+          shading += localLight * visibility;
+      }
+
+      color += attenuation * shading * (1.0 - hit.reflectivity);
+
+      if (hit.reflectivity <= 0.0) break;
+      attenuation *= hit.reflectivity;
+      ray = Ray(hit.point + hit.normal * 0.002, reflect(ray.direction, hit.normal));
+  }
+
+  return color;
 }
 
 void main() {
-    initScene(u_time);
+  initScene(u_time);
 
-    // Orbit camera around the scene center
-    float cp = cos(u_cameraOrbit.x), sp = sin(u_cameraOrbit.x);
-    float cy = cos(u_cameraOrbit.y), sy = sin(u_cameraOrbit.y);
-    mat3 rotX = mat3(1.0, 0.0, 0.0,  0.0, cp, -sp,  0.0, sp, cp);
-    mat3 rotY = mat3(cy, 0.0, -sy,  0.0, 1.0, 0.0,  sy, 0.0, cy);
-    mat3 camera = rotY * rotX;
+  // Orbit camera around the scene center
+  float cp = cos(u_cameraOrbit.x), sp = sin(u_cameraOrbit.x);
+  float cy = cos(u_cameraOrbit.y), sy = sin(u_cameraOrbit.y);
+  mat3 rotX = mat3(1.0, 0.0, 0.0,  0.0, cp, -sp,  0.0, sp, cp);
+  mat3 rotY = mat3(cy, 0.0, -sy,  0.0, 1.0, 0.0,  sy, 0.0, cy);
+  mat3 camera = rotY * rotX;
 
-    vec3 target = vec3(0.0, 0.0, -5.0);
-    vec2 uv = (gl_FragCoord.xy - 0.5 * u_resolution) / u_resolution.y;
-    Ray ray = Ray(target + camera * vec3(0.0, 0.0, 7.0), camera * normalize(vec3(uv, -1.5)));
+  vec3 target = vec3(0.0, 0.0, -5.0);
+  vec3 camOrigin = target + camera * vec3(0.0, 0.0, 7.0);
 
-    fragColor = vec4(pow(trace(ray), vec3(1.0 / 2.2)), 1.0);  // gamma correction
+  vec3 totalColor = vec3(0.0);
+  for (int s = 0; s < SAMPLES_PER_PIXEL; s++) {
+      vec2 subpixel = vec2(float(s % 2), float(s / 2)) * 0.5 + 0.25;
+      vec2 uv = (gl_FragCoord.xy - 0.5 + subpixel - 0.5 * u_resolution) / u_resolution.y;
+      Ray ray = Ray(camOrigin, camera * normalize(vec3(uv, -1.5)));
+      totalColor += trace(ray, float(s));
+  }
+  totalColor /= float(SAMPLES_PER_PIXEL);
+
+  fragColor = vec4(pow(max(totalColor, 0.0), vec3(1.0 / 2.2)), 1.0);
 }
 </script>
 
@@ -378,7 +424,10 @@ void main() {
 
   const bounces = document.getElementById("bounces");
   const ambient = document.getElementById("ambient");
-  for (const slider of [bounces, ambient]) {
+  const shininess = document.getElementById("shininess");
+  const attenuation = document.getElementById("attenuation");
+
+  for (const slider of [bounces, ambient, shininess, attenuation]) {
     slider.addEventListener("input", () => document.getElementById(slider.id + "Value").textContent = slider.value);
   }
 
@@ -400,6 +449,8 @@ void main() {
     gl.uniform2f(uniform("u_resolution"), canvas.width, canvas.height);
     gl.uniform1i(uniform("u_maxBounces"), bounces.value);
     gl.uniform1f(uniform("u_ambientStrength"), ambient.value);
+    gl.uniform1f(uniform("u_attenuation"), Number(attenuation.value));
+    gl.uniform1f(uniform("u_shininess"), Number(shininess.value));
     gl.uniform2f(uniform("u_cameraOrbit"), pitch, yaw);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
